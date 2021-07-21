@@ -13,22 +13,22 @@ parser.add_argument('--weights', type=str, default='./weights/yolov5l.pt')
 args = parser.parse_args()
 weights_path = Path(args.weights)
 
-model = torch.load(weights_path)
-model_src = model['model']
+model_ckpt = torch.load(weights_path)
+model_src = model_ckpt['model']
 model_src_dict = model_src.state_dict()
-print('model_src_ckpt:{}'.format(model.keys()))
+
 model_dst = Model(ch=3, nc=80)
 model_dst_dict = model_dst.state_dict()
-model_dst.load_state_dict(model_dst_dict)
+
 model_dst_keys_list = list(model_dst_dict.keys())
 
-# 两个模型的权重名字打印出来
-for m1, m2 in zip(model_src_dict, model_dst_dict):
-    print(m1, ' || ', m2)
+for i, (v1, v2) in enumerate(zip(model_src_dict.values(), model_dst_dict.values())):
+    if v1.shape != v2.shape:
+        print(model_dst_keys_list[i])
 
 for ind, value in enumerate(model_src_dict.values()):
     model_dst_dict[model_dst_keys_list[ind]] = value
-
+model_dst.load_state_dict(model_dst_dict)
 ckpt = {
     'epoch': -1,
     'best_fitness': None,

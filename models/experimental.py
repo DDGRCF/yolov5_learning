@@ -110,8 +110,11 @@ class Ensemble(nn.ModuleList):
         return y, None  # inference, train output
 
 
-def attempt_load(weights, map_location=None, inplace=True):
-    from models.yolo import Detect, Model
+def attempt_load(weights, map_location=None, reconstruct=False, inplace=True):
+    if reconstruct:
+        from models.yolol import Detect, Model
+    else:
+        from models.yolo import Detect, Model
 
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
     model = Ensemble()
@@ -128,6 +131,7 @@ def attempt_load(weights, map_location=None, inplace=True):
 
     if len(model) == 1:
         return model[-1]  # return model
+
     else:
         print(f'Ensemble created with {weights}\n')
         for k in ['names']:
