@@ -25,6 +25,8 @@ model_dst_keys_list = list(model_dst_dict.keys())
 for i, (v1, v2) in enumerate(zip(model_src_dict.values(), model_dst_dict.values())):
     if v1.shape != v2.shape:
         print(model_dst_keys_list[i])
+for i, (n, p) in enumerate(model_dst.named_parameters()):
+    print(i, n, p.shape)
 
 for ind, value in enumerate(model_src_dict.values()):
     model_dst_dict[model_dst_keys_list[ind]] = value
