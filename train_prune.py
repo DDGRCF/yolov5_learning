@@ -17,7 +17,7 @@ from tqdm import tqdm
 from threading import Thread
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())
-from utils.torch_utils import select_device, de_parallel
+from utils.torch_utils import ModelEMA, select_device, de_parallel, intersect_dicts, ModelEMA
 from utils.general import init_seeds, check_img_size, labels_to_class_weights, increment_path, set_logging
 # from utils.google_utils import attempt_download
 from utils.datasets import create_dataloader
@@ -34,14 +34,14 @@ def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='weights/yolov5l_new.pt', help='the pretrained weights')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='the dataset configuration')
-    parser.add_argument('--hyp', type=str, default='data/hyps/hyp.finetune.yaml')
+    parser.add_argument('--hyp', type=str, default='data/hyps/hyp.scratch.yaml')
     parser.add_argument('--project', type=str, default='runs/train', help='the train info dir')
     parser.add_argument('--epochs', type=int, default=100, help='the train epochs')
-    parser.add_argument('--device', type=str, default='0')
+    parser.add_argument('--device', type=str, default='0, 1')
     parser.add_argument('--adam', action='store_true')
-    parser.add_argument('--batch-size', type=int, default=2, help='train batch size')
-    parser.add_argument('--workers', type=int, default=2, help='the workers')
-    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--batch-size', type=int, default=8, help='train batch size')
+    parser.add_argument('--workers', type=int, default=4, help='the workers')
+    parser.add_argument('--resume', type=str, default='', help='empty is not resume')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, val] image sizes')
     parser.add_argument('--logging_fre', type=int, default=5, help='the info frequency to print')
@@ -51,9 +51,9 @@ def parse_opt():
     return opt
 
 def train(hyp, opt, device):
-    save_dir, epochs, batch_size, weights, data, workers = \
+    save_dir, epochs, batch_size, weights, data, workers, resume = \
     opt.save_dir, opt.epochs, opt.batch_size, opt.weights, opt.data, \
-    opt.workers
+    opt.workers, opt.resume
 
     # Directory
     save_dir = Path(save_dir)
@@ -77,7 +77,7 @@ def train(hyp, opt, device):
     cuda = device.type != 'cpu'
     with open(data) as f:
         data_dict = yaml.safe_load(f)
-    nc = data_dict['nc']
+    nc = int(data_dict['nc'])
     names = data_dict['names']
     
     # Model
@@ -86,15 +86,17 @@ def train(hyp, opt, device):
         weights = Path(weights)
         assert weights.exists(), 'the pretrained weight dont exist'
         ckpt = torch.load(weights, map_location=device)
+        exclude = ['anchor'] if not resume else []
         model = Model(ch=3, nc=nc).to(device)
         state_dict = ckpt['model'].float().state_dict()
+        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)
         model.load_state_dict(state_dict, strict=False)
     data_root = Path(data_dict['path'])
     train_path = data_root / data_dict['train']
     val_path = data_root / data_dict['val']
 
     # Optimizer
-    nbs = 640
+    nbs = 64
     accumulate = max(round(nbs / batch_size), 1)
     hyp['weight_decay'] *= batch_size * accumulate / nbs
     optimizer = param_group_train(model, hyp)
@@ -107,7 +109,9 @@ def train(hyp, opt, device):
         start_epoch = ckpt['epoch'] + 1 if ckpt['epoch'] is not None else 1
 
     del ckpt, state_dict
-
+    # EMA
+    ema = ModelEMA(model)
+    # Datasets config
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.detect.nl
     imgsz, imgsz_val = [check_img_size(x, gs) for x in opt.img_size]
@@ -116,13 +120,13 @@ def train(hyp, opt, device):
     if cuda and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, False, 
-                                             hyp=hyp, augment=True, rect=False, workers=workers)
+    dataloader = create_dataloader(train_path, imgsz, batch_size, gs, False, 
+                                             hyp=hyp, augment=True, rect=False, workers=workers)[0]
     nb = len(dataloader)
     valloader = create_dataloader(val_path, imgsz_val, batch_size // 2, gs, False,
     hyp=hyp, rect=True, workers=workers, pad=0.5)[0]
     
-    model.float()
+    # model.half().float()
 
     # Model parameters
     hyp['box'] *= 3. / nl  # scale to layers
@@ -133,7 +137,6 @@ def train(hyp, opt, device):
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
     model.names = names
-    # model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
 
     # start training_results
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)
@@ -155,7 +158,7 @@ def train(hyp, opt, device):
             # Warmup
             if ni <= nw:
                 xi =  [0, nw]
-                accumulate = max(1, np.interp(ni, xi, [0, nbs / batch_size]))
+                accumulate = max(1, np.interp(ni, xi, [0, nbs / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
@@ -168,10 +171,11 @@ def train(hyp, opt, device):
                 scaler.scale(loss).backward()
 
             # Optimize
-            if ni -last_opt_step >= accumulate:
+            if ni - last_opt_step >= accumulate:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+                ema.update(model)
                 last_opt_step = ni
             mloss = (mloss * i + loss_items) / (i + 1)
             s = ('%10s' + '%10.4g' * 6) % (f'{epoch}/{epochs - 1}', *mloss, targets.shape[0], imgs.shape[-1])
@@ -181,7 +185,10 @@ def train(hyp, opt, device):
         ckpt = {
             'epoch': epoch,
             'model': deepcopy(de_parallel(model)).half(),
-            'optimizer': optimizer.state_dict()
+            'optimizer': optimizer.state_dict(),
+            'ema':deepcopy(ema.ema).half(),
+            'update':ema.updates,
+            'optimizer':optimizer.state_dict()
         }
         torch.save(ckpt, last)
         for m in [last, best] if best.exists() else [last]:
