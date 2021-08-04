@@ -22,14 +22,14 @@ model_dst_dict = model_dst.state_dict()
 
 model_dst_keys_list = list(model_dst_dict.keys())
 
-for i, (v1, v2) in enumerate(zip(model_src_dict.values(), model_dst_dict.values())):
-    if v1.shape != v2.shape:
-        print(model_dst_keys_list[i])
-for i, (n, p) in enumerate(model_dst.named_parameters()):
-    print(i, n, p.shape)
+for i, (k, v) in enumerate(model_src.state_dict().items()):
+    if 'num_batches_tracked' in k:
+        print(f'{i}|{k}|{v}')
+# for i, n in enumerate(zip(model_dst.named_parameters(), model_src.named_parameters())):
+#     print(f'{i}|{n[1][0]}|{n[0][0]}|{n[1][1].shape}')
 
-for ind, value in enumerate(model_src_dict.values()):
-    model_dst_dict[model_dst_keys_list[ind]] = value
+# for ind, value in enumerate(model_src_dict.values()):
+#     model_dst_dict[model_dst_keys_list[ind]] = value
 model_dst.load_state_dict(model_dst_dict)
 ckpt = {
     'epoch': -1,

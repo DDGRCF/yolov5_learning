@@ -117,10 +117,10 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False, visualize=False):
+    def forward(self, x, augment=False, profile=False, visualize=False, features=False):
         if augment:
             return self.forward_augment(x)  # augmented inference, None
-        return self.forward_once(x, profile, visualize)  # single-scale inference, train
+        return self.forward_once(x, profile, visualize, features)  # single-scale inference, train
 
     def forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width
@@ -135,8 +135,9 @@ class Model(nn.Module):
             y.append(yi)
         return torch.cat(y, 1), None  # augmented inference, train
 
-    def forward_once(self, x, profile=False, visualize=False):
+    def forward_once(self, x, profile=False, visualize=False, features=False):
         y, dt = [], []  # outputs
+        z = []
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
@@ -153,13 +154,17 @@ class Model(nn.Module):
 
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
-
+            if features:
+                z.append(x)
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
 
         if profile:
             logger.info('%.1fms total' % sum(dt))
-        return x
+        if features:
+            return z
+        else:
+            return x
 
     def _descale_pred(self, p, flips, scale, img_size):
         # de-scale predictions following augmented inference (inverse operation)

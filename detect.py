@@ -23,7 +23,6 @@ from utils.general import check_img_size, check_requirements, check_imshow, colo
 from utils.plots import colors, plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized
 
-
 @torch.no_grad()
 def run(weights='yolov5s.pt',  # model.pt path(s)
         source='data/images',  # file/dir/URL/glob, 0 for webcam
@@ -49,7 +48,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
         hide_labels=False,  # hide labels
         hide_conf=False,  # hide confidences
         half=False,  # use FP16 half-precision inference
-        reconstruct=False # use reconstruct model
+        use_pruning=False # use reconstruct model
         ):
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
@@ -65,7 +64,7 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
     half &= device.type != 'cpu'  # half precision only supported on CUDA
 
     # Load model
-    model = attempt_load(weights, map_location=device, reconstruct=reconstruct)  # load FP32 model
+    model = attempt_load(weights, map_location=device, pruning=use_pruning)  # load FP32 model
     stride = int(model.stride.max())  # model stride
     imgsz = check_img_size(imgsz, s=stride)  # check image size
     names = model.module.names if hasattr(model, 'module') else model.names  # get class names
@@ -214,7 +213,7 @@ def parse_opt():
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
-    parser.add_argument('--reconstruct', action='store_true', help='whether or not use construct model')
+    parser.add_argument('--use-pruning', action='store_true', help='whether or not use construct model')
     opt = parser.parse_args()
     return opt
 

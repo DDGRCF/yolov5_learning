@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import logging
 from utils.general import colorstr
+from utils.torch_utils import is_parallel
 logger = logging.getLogger(__name__)
 
 class Mask:
@@ -16,10 +17,12 @@ class Mask:
         self.model_length = {}
         self.compress_rate = {}
         self.mat = {}
-        self.model = model
+        self.model = model.module if is_parallel(model) else model
         self.mask_index = []
         self.opt = opt if opt is not None else kwargs
-
+        self.layer_begin, self.layer_end, self.layer_inter = [
+            int(i.strip(' ')) for i in opt.layer_gap.split(',')
+        ]
     def init_length(self):
         for index, item in enumerate(self.model.parameters()):
             self.model_size[index] = item.size()
@@ -28,20 +31,26 @@ class Mask:
     def init_rate(self, layer_rate):
         for index, item in enumerate(self.model.parameters()):
             self.compress_rate[index] = 1
-        for key in range(self.opt.layer_begin, self.opt.layer_end, self.opt.layer_inter):
+        for key in range(self.layer_begin, self.layer_end, self.layer_inter):
             self.compress_rate[key] = layer_rate
-        last_index = None
+        last_index = 320
         skip_list = []
+        # [18,24,30, 
+        # 48,54,60,66,72,78,84,90,96, 
+        # 114,120,126,132,138,144,150,156,162,
+        # 186,192,198]
         self.mask_index = [x for x in range(0, last_index, 3)]
-        if self.opt.skip_downsample == 1:
+        if self.opt.skip_downsample:
             for x in skip_list:
                 self.compress_rate[x] = 1
                 self.mask_index.remove(x)
-        prefix = colorstr('mask_index:')
-        logger.info('{}{}'.format(prefix, self.mask_index))
-    
-    def init_mask(self, layer_rate):
+
+    def init_mask(self, layer_rate, print_info=True):
         self.init_rate(layer_rate)
+        if print_info:
+            prefix = colorstr('mask_index:')
+            logging.info('{}\n{}'.format(prefix, self.mask_index))
+
         for index, item in enumerate(self.model.parameters()):
             if (index in self.mask_index):
                 self.mat[index] = self.get_filter_codebook(item.data, self.compress_rate[index], 
@@ -49,7 +58,7 @@ class Mask:
                 self.mat[index] = self.convert2tensor(self.mat[index])
                 if self.cuda:
                     self.mat[index] = self.mat[index].to(self.device)
-        logging.info('mask Ready')
+        logging.info('Mask Ready...')
 
     def do_mask(self):
         for index, item in enumerate(self.model.parameters()):
@@ -57,13 +66,13 @@ class Mask:
                 a = item.data.view(self.model_length[index])
                 b = a * self.mat[index]
                 item.data = b.view(self.model_size[index])
-        logging.info('mask Done')
+        logging.info('Mask Done...')
         
     def get_filter_codebook(self, weight_torch, compress_rate, length):
         codebook = np.ones(length)
         if len(weight_torch.size()) == 4:
             filter_pruned_num = int(weight_torch.size()[0] * (1 - compress_rate)) 
-            weight_vec = weight_torch.view(weight_torch.size()[0], -1)
+            weight_vec = weight_torch.view(weight_torch.size()[0], -1) # view不是inplace，重新复制了一份
             norm2 = torch.norm(weight_vec, 2, 1) 
             norm2_np = norm2.cpu().numpy()
             filter_index = norm2_np.argsort()[:filter_pruned_num]
@@ -73,8 +82,7 @@ class Mask:
             return codebook
 
     def convert2tensor(self, x):
-        x = torch.FloatTensor(x)
-        
+        x = torch.FloatTensor(x) 
         return x
 
     def get_codebook(self, weight_torch, compress_rate, length):
@@ -91,11 +99,23 @@ class Mask:
 
         return weight_np
 
-    def if_zero(self):
+    def if_zero(self, epoch=None, save_file=None):
+        prefix_print = True
         for index, item in enumerate(self.model.parameters()):
-            if index in [x for x in range(self.opt.layer_begin, self.opt.layer_end, self.opt.layer_inter)]:
+            if index in [x for x in range(self.layer_begin, self.layer_end, self.layer_inter)]:
                 a = item.data.view(self.model_length[index])
                 b = a.cpu().numpy()
-                prefix = colorstr('layer:')
-                logger.info('{}{}, number of nonzero weight is {}, zero is {}'.format(prefix, 
-                            index, np.count_nonzero(b), len(b) - np.count_nonzero(b)))
+                if save_file is not None:
+                    assert save_file.match('*.txt'), 'the prune save must be txt'
+                    with open(save_file, 'a') as fw:
+                        if epoch is not None and prefix_print:
+                            prefix = '>' * 20 + f' epoch:{epoch} ' + '<' * 20 + '\n'
+                            fw.write(prefix)
+                            prefix_print = False
+                        fw.write('layer:{}, number of nonzero weight is {}, zero is {}\n'.format(index, 
+                                  np.count_nonzero(b), len(b) - np.count_nonzero(b)))
+                else:
+                    prefix = colorstr('layer:')
+                    logging.info('{}{}, number of nonzero weight is {}, zero is {}'.format(prefix, 
+                                index, np.count_nonzero(b), len(b) - np.count_nonzero(b)))
+                

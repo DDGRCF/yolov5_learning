@@ -46,7 +46,7 @@ from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 from utils.metrics import fitness
-
+from utils.prune_utils import Mask
 logger = logging.getLogger(__name__)
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
@@ -57,9 +57,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
           device,
           ):
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, = \
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, use_pruning= \
         opt.save_dir, opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
-        opt.resume, opt.noval, opt.nosave, opt.workers
+        opt.resume, opt.noval, opt.nosave, opt.workers, opt.use_pruning
 
     # Directories
     save_dir = Path(save_dir)
@@ -266,12 +266,33 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
-
+    # Do mask
+    if use_pruning:
+        mask = Mask(model, device, opt) 
+        mask.init_length()
+        map_old = round(val.run(data = data_dict, 
+                                batch_size = batch_size // WORLD_SIZE * 2, 
+                                imgsz = imgsz_val, 
+                                model = mask.model, 
+                                plots=False,
+                                dataloader=valloader)[0][3], 3)
+        mask.init_mask(opt.layer_rate)
+        mask.do_mask()
+        map_new = round(val.run(data = data_dict, 
+                                batch_size = batch_size // WORLD_SIZE * 2, 
+                                imgsz = imgsz_val, 
+                                model=mask.model, 
+                                plots=False,
+                                dataloader=valloader)[0][3], 3)
+        mask.if_zero()
+        prefix = colorstr('Try pruning:')
+        logging.info(f'{prefix} Old mAp:{map_old} | New mAp:{map_new}')
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
+    mAp = None
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
@@ -385,6 +406,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # mAP
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
+
             if not noval or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
                 results, maps, _ = val.run(data_dict,
@@ -399,7 +421,20 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            plots=plots and final_epoch,
                                            wandb_logger=wandb_logger,
                                            compute_loss=compute_loss)
-
+            # Do mask
+            if use_pruning:
+                if (epoch % opt.pruning_frequency == 0 or final_epoch):
+                    mask.init_mask(opt.layer_rate, False)
+                    mask.do_mask()
+                    mask.if_zero(epoch, save_dir / opt.pruning_details_file)
+                    mAp = round(val.run(data_dict,
+                                        batch_size = batch_size // WORLD_SIZE * 2, 
+                                        imgsz = imgsz_val,
+                                        model = mask.model,
+                                        plots = False,
+                                        dataloader = valloader)[0][3], 3)
+                    prefix = colorstr('Pruning Results:')
+                    logging.info(f'{prefix} Before mAp:{round(results[3], 3)} | After mAp:{mAp}')
             # Write
             with open(results_file, 'a') as f:
                 f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
@@ -468,7 +503,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Strip optimizers
             for f in last, best:
                 if f.exists():
-                    strip_optimizer(f)  # strip optimizers
+                    strip_optimizer(f, use_pruning = use_pruning)  # strip optimizers
             if loggers['wandb']:  # Log the stripped model
                 loggers['wandb'].log_artifact(str(best if best.exists() else last), type='model',
                                               name='run_' + wandb_logger.wandb_run.id + '_model',
@@ -481,6 +516,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
+    # orginal config
     parser.add_argument('--weights', type=str, default='weights/yolov5l.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='dataset.yaml path')
@@ -515,6 +551,14 @@ def parse_opt(known=False):
     parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+    # train prune config
+    parser.add_argument('--use-pruning', action='store_true', help='whether use pruning or not')
+    parser.add_argument('--pruning-frequency', type=int, default=1, help='the inter epoch to prune')
+    parser.add_argument('--layer-rate', type=float, default='1.0', help='the ratio of pruning')
+    parser.add_argument('--layer-gap', type=str, default='0, 320, 3')
+    parser.add_argument('--skip-downsample', action='store_true', help='whether skip the corresponding layers')
+    parser.add_argument('--pruning_details_file', type=str, default='pruning_details_file.txt', help='pruning details file')
+    
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 

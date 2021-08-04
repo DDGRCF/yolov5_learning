@@ -110,9 +110,9 @@ class Ensemble(nn.ModuleList):
         return y, None  # inference, train output
 
 
-def attempt_load(weights, map_location=None, reconstruct=False, inplace=True):
-    if reconstruct:
-        from models.yolol import Detect, Model
+def attempt_load(weights, map_location=None, pruning=False, inplace=True):
+    if pruning:
+        from models.yolov5l_pruning import Detect, Model
     else:
         from models.yolo import Detect, Model
 
