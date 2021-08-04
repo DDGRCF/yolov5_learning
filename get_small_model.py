@@ -36,8 +36,7 @@ def main(opt):
     for i, m in enumerate(cfg['backbone'] + cfg['head']):
         input_from[i] = m[0]
         shortcut[i] = m[3][-1]
-    # special deals
-    exclude_special = ['m']
+
     # Pruning the params
     first_layer = 0
     last_layer = 641
@@ -52,8 +51,8 @@ def main(opt):
     for i, (n, param) in enumerate(state_dict_strip.items()):
         m_index = int(n.split('.')[0])
         if i in layer_index: # 获得保留权重的通道和去除权重通道的index
-            if shortcut[m_index] and 'cv1' in n and 'm' not in n:  
-                keep_index = torch.tensor(range(param.shape[0])).long()
+            if shortcut[m_index] == True and 'cv1' in n and 'm' not in n:  
+                keep_index = torch.LongTensor(range(param.shape[0]))
             else:
                 keep_index = torch.nonzero(torch.sum(param.data, dim=(1, 2, 3)) != 0).view(-1) 
             state_dict_[n] = param[keep_index].clone()
@@ -68,9 +67,9 @@ def main(opt):
             if len(param.shape) != 0:
                 state_dict_[n] = param[keep_mask[-1][-1]].clone()
             else:
-                state_dict_[n] = param
+                state_dict_[n] = param.clone()
         else:
-            state_dict_[n] = param
+            state_dict_[n] = param.clone()
     del state_dict_strip
     # prune the input channels params
     index_ = -1
@@ -78,9 +77,9 @@ def main(opt):
         m_index = int(n.split('.')[0])
         if i in layer_index:
             index_ += 1
-            if i == 0:
+            if index_ == 0:
                 continue
-            if all([j not in n for j in exclude_special]):
+            if  'm' not in n:
                 if 'cv1' in n:
                     f = input_from[m_index - 1]
                     if isinstance(f, list):
@@ -106,16 +105,16 @@ def main(opt):
                     state_dict_[n] = param[:, k].clone()
                     continue
                 elif 'cv3' in n:
-                    if shortcut[m_index]:
-                        k1 = torch.tensor(range(keep_mask[index_ - 1][0][0])).long()
+                    if shortcut[m_index] == True:
+                        k1 = torch.LongTensor(range(keep_mask[index_ - 1][0][0]))
                     else:
                         k1 = keep_mask[index_ - 1][-1]
                     k2 = channel_index[m_index][1][-1] + keep_mask[index_ - 1][0][0]
                     k = torch.cat((k1, k2), dim=0)
                     state_dict_[n] = param[:, k].clone()
                     continue
-            if shortcut[m_index] and 'cv1' in n and 'm' in n:
-               k = torch.tensor(range(keep_mask[index_ - (2 if 'm.0' in n else 1)][0][0])).long()
+            if shortcut[m_index] == True and 'cv1' in n and 'm' in n:
+               k = torch.LongTensor(range(keep_mask[index_ - (2 if 'm.0' in n else 1)][0][0]))
             else:
                 k = keep_mask[index_ - (2 if 'm.0' in n else 1)][-1]
             state_dict_[n] = param[:, k].clone()
@@ -149,9 +148,16 @@ def main(opt):
         f.write(json.dumps(channel_index))
 
     model_pruning = Model_Pruning(cfg, channel_index=channel_index)
+       
+    new_state_dict = OrderedDict()
+    for i, (n1, n2) in enumerate(zip(state_dict_.items(), model_pruning.state_dict().items())):
+        assert n1[-1].shape == n2[-1].shape, 'there are errors in state_dict_'
+        new_state_dict[n2[0]] = state_dict_[n1[0]]
+    model_pruning.load_state_dict(new_state_dict, strict=True)
     # compare
     model.eval()
     model_pruning.eval()
+
     with torch.no_grad():
         input = torch.randn((1, 3, 640, 640))
         output = model(input, features=True)
@@ -161,14 +167,9 @@ def main(opt):
                 o1 = o1[0]
                 o2 = o2[0]
             different = torch.norm(o1) - torch.norm(o2)
-            print(f"the different of the {i}th is {different} | {torch.norm(o1)} | {torch.norm(o2)}")
-            
-    new_state_dict = OrderedDict()
-    for i, (n1, n2) in enumerate(zip(state_dict_.items(), model_pruning.state_dict().items())):
-        assert n1[-1].shape == n2[-1].shape, 'there are errors in state_dict_'
-        if 'track_running_stats' not in n1[0]:
-            new_state_dict[n2[0]] = state_dict_[n1[0]]
-    model_pruning.load_state_dict(new_state_dict, strict=True)
+            print(f"the different of the {i}th is {different} | {torch.norm(o1)} - {torch.norm(o2)}")
+    
+    # save model
     ckpt['model'] = model_pruning.half()
     torch.save(ckpt, pruning_weights)
 

@@ -100,7 +100,7 @@ class Model(nn.Module):
         f = [None, 3, None]
         y = []
         for si, fi in zip(s, f):
-            xi = scale_img(x.flip(fi) if fi else x, si, gi=int(self.stride.max()))
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
             yi = self.forward_once(xi)[0]
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
@@ -119,8 +119,8 @@ class Model(nn.Module):
             y.append(x if m.i in self.save else None)
             if features:
                 z.append(x)
-        if visualize:
-            feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
         if features:
             return z
         else:
