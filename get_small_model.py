@@ -9,6 +9,7 @@ import json
 from models.yolo import Model as Model
 from models.yolov5l_pruning import Model as Model_Pruning
 from pathlib import Path
+from copy import deepcopy
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())
 
@@ -20,7 +21,7 @@ def main(opt):
     # Load the model
     weights = Path(weights)
     pruning_weights = weights.parents[0] / ('pruning_' + weights.name)
-    pruning_cfg = weights.parents[0] / 'pruning_cfg.json'
+    pruning_cfg = weights.parents[0] / 'pruning_cfg.pt'
     cfg = Path(cfg)
     assert weights.match('*.pt'), 'the file must be the type of *.pt '
     ckpt = torch.load(weights, map_location=lambda storage, loc: storage) # 将权重从gpu上加载进cpu中
@@ -51,7 +52,7 @@ def main(opt):
     for i, (n, param) in enumerate(state_dict_strip.items()):
         m_index = int(n.split('.')[0])
         if i in layer_index: # 获得保留权重的通道和去除权重通道的index
-            if shortcut[m_index] == True and 'cv1' in n and 'm' not in n:  
+            if shortcut[m_index] == True and '.cv1.' in n and '.m.' not in n:  
                 keep_index = torch.LongTensor(range(param.shape[0]))
             else:
                 keep_index = torch.nonzero(torch.sum(param.data, dim=(1, 2, 3)) != 0).view(-1) 
@@ -63,14 +64,18 @@ def main(opt):
             else:
                 channel_index[m_index] = [(param.shape, keep_index)]
  
-        elif (i not in layer_index) and (first_layer < i < last_layer):
+        elif (i not in layer_index) and (first_layer < i < last_layer + 1):
             if len(param.shape) != 0:
                 state_dict_[n] = param[keep_mask[-1][-1]].clone()
             else:
                 state_dict_[n] = param.clone()
         else:
             state_dict_[n] = param.clone()
-    del state_dict_strip
+
+    for i, (n1, n2) in enumerate(zip(state_dict_strip.items(), state_dict_.items())):
+        if i in layer_index:
+            print(f"{n1[0]} | {torch.norm(n1[-1]) - torch.norm(n2[-1])}")
+    # del state_dict_strip
     # prune the input channels params
     index_ = -1
     for i, (n, param) in enumerate(state_dict_.items()):
@@ -79,8 +84,8 @@ def main(opt):
             index_ += 1
             if index_ == 0:
                 continue
-            if  'm' not in n:
-                if 'cv1' in n:
+            if  '.m.' not in n:
+                if '.cv1.' in n:
                     f = input_from[m_index - 1]
                     if isinstance(f, list):
                         k1 = keep_mask[index_ - 1][-1]
@@ -113,10 +118,10 @@ def main(opt):
                     k = torch.cat((k1, k2), dim=0)
                     state_dict_[n] = param[:, k].clone()
                     continue
-            if shortcut[m_index] == True and 'cv1' in n and 'm' in n:
-               k = torch.LongTensor(range(keep_mask[index_ - (2 if 'm.0' in n else 1)][0][0]))
+            if shortcut[m_index] == True and '.cv1.' in n:
+               k = torch.LongTensor(range(keep_mask[index_ - (2 if '.0.' in n else 1)][0][0]))
             else:
-                k = keep_mask[index_ - (2 if 'm.0' in n else 1)][-1]
+                k = keep_mask[index_ - (2 if '.0.' in n else 1)][-1]
             state_dict_[n] = param[:, k].clone()
         elif i > last_layer:
             if 'anchor' not in n:
@@ -124,6 +129,8 @@ def main(opt):
                 if 'weight' in n:
                     k = channel_index[f[int((i - last_layer - 3) / 2)]][-1][-1]
                     state_dict_[n] = param[:, k].clone()
+
+
 
     channel_index = OrderedDict()
     index_ = -1
@@ -153,7 +160,11 @@ def main(opt):
     for i, (n1, n2) in enumerate(zip(state_dict_.items(), model_pruning.state_dict().items())):
         assert n1[-1].shape == n2[-1].shape, 'there are errors in state_dict_'
         new_state_dict[n2[0]] = state_dict_[n1[0]]
+
     model_pruning.load_state_dict(new_state_dict, strict=True)
+    for i, (n1, n2) in enumerate(zip(state_dict_strip.items(), state_dict_.items())):
+        if i in layer_index:
+            print(f"{n1[0]} | {torch.norm(n1[-1]) - torch.norm(n2[-1])}")
     # compare
     model.eval()
     model_pruning.eval()
@@ -170,7 +181,7 @@ def main(opt):
             print(f"the different of the {i}th is {different} | {torch.norm(o1)} - {torch.norm(o2)}")
     
     # save model
-    ckpt['model'] = model_pruning.half()
+    ckpt['model'] = deepcopy(model_pruning.half())
     torch.save(ckpt, pruning_weights)
 
 def strip_params(model):

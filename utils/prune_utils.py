@@ -1,3 +1,4 @@
+from typing import OrderedDict
 import torch
 import numpy as np
 import logging
@@ -33,12 +34,14 @@ class Mask:
             self.compress_rate[index] = 1
         for key in range(self.layer_begin, self.layer_end, self.layer_inter):
             self.compress_rate[key] = layer_rate
-        last_index = 320
-        skip_list = []
-        # [18,24,30, 
-        # 48,54,60,66,72,78,84,90,96, 
-        # 114,120,126,132,138,144,150,156,162,
-        # 186,192,198]
+        last_index = 321
+        skip_list = [0, 3] #[x for x in range(0, last_index, 3) if x not in range(0, 201, 3)]
+        # [0,3, 
+        # 6,15,21,27,
+        # 36,45,51,57,63,69,75,81,87,93,
+        # 102,111,117,123,129,135,141,147,153,159,
+        # 174,183,189,195]
+
         self.mask_index = [x for x in range(0, last_index, 3)]
         if self.opt.skip_downsample:
             for x in skip_list:
@@ -118,4 +121,21 @@ class Mask:
                     prefix = colorstr('layer:')
                     logging.info('{}{}, number of nonzero weight is {}, zero is {}'.format(prefix, 
                                 index, np.count_nonzero(b), len(b) - np.count_nonzero(b)))
+
+
+def get_pruning_cfg(cfg):
+    new_cfg = OrderedDict()
+    for k, v in cfg.items():
+        for cfg in v:
+            if isinstance(cfg, list):
+                cfg = tuple(cfg)
+            if isinstance(k, str):
+                k = int(k)
+            if k in new_cfg:
+                new_cfg[k] += [cfg]
+            else:
+                new_cfg[k] = [cfg]
+    logging.info('the pruning configuration convertion complete!')
+    return new_cfg
+
                 

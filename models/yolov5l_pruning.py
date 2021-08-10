@@ -4,10 +4,13 @@ import yaml
 import logging
 import thop
 import math
+import json
+from pathlib import Path
 from models.common_pruning import *
 from utils.autoanchor import check_anchor_order
 from utils.torch_utils import initialize_weights, scale_img, fuse_conv_and_bn, model_info
 from utils.plots import feature_visualization
+from utils.prune_utils import get_pruning_cfg
 
 logger = logging.getLogger(__name__)
 class Detect(nn.Module):
@@ -67,6 +70,14 @@ class Model(nn.Module):
                 self.cfg = yaml.safe_load(f)
         else:
             self.cfg = cfg
+
+        if isinstance(channel_index, str) or isinstance(channel_index, Path):
+            assert channel_index.match('*.json'), 'this is not pruning cfg'
+            with open(channel_index, 'rb') as f:
+                self.channel_index = get_pruning_cfg(json.load(f))
+        else:
+            self.channel_index = channel_index
+
         ch = self.cfg['ch'] = self.cfg.get('ch', ch)
         if nc and nc != self.cfg['nc']:
             logger.info(f"Overriding model.yaml nc={self.cfg['nc']} with nc={nc}")
@@ -74,7 +85,7 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.cfg['anchors'] = round(anchors)
-        self.model, self.save = build_model(cfg, channel_index) 
+        self.model, self.save = build_model(self.cfg, self.channel_index) 
         self.names = [str(i) for i in range(self.cfg['nc'])]
         self.inplace = self.cfg.get('inplace', True)
         m = self.model[-1]
@@ -188,7 +199,7 @@ def build_model(cfg, ch_p):
     layers, save = [], []
     for i, (f, n, m, args) in enumerate(cfg['backbone'] + cfg['head']):
         m = eval(m)
-        args = [ch_p.get(i, None), *args[1: ]]
+        args = [ch_p.get(i), *args[1: ]]
         if m is C3:
             args.insert(1, n)
         elif m is Detect:

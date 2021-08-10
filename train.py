@@ -24,6 +24,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data
 import yaml
+import json
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -46,7 +47,7 @@ from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 from utils.metrics import fitness
-from utils.prune_utils import Mask
+from utils.prune_utils import Mask, get_pruning_cfg
 logger = logging.getLogger(__name__)
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
@@ -57,9 +58,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
           device,
           ):
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, use_pruning= \
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, use_pruning, retrain= \
         opt.save_dir, opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
-        opt.resume, opt.noval, opt.nosave, opt.workers, opt.use_pruning
+        opt.resume, opt.noval, opt.nosave, opt.workers, opt.use_pruning, opt.retrain
 
     # Directories
     save_dir = Path(save_dir)
@@ -68,6 +69,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
+    if retrain:
+        from models.yolov5l_pruning import Model
+        pruning_cfg = Path(weights).parents[0] / opt.pruning_cfg
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -118,14 +122,20 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         with torch_distributed_zero_first(RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        if retrain:
+            model = Model(cfg, ch=3, nc=nc, channel_index=pruning_cfg, anchors=hyp.get('anchors')).to(device)
+        else:
+            model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        if retrain:
+            model = Model(cfg, ch=3, nc=nc, channel_index=pruning_cfg, anchors=hyp.get('anchors')).to(device)
+        else:
+            model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(RANK):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -178,9 +188,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
+    if use_pruning:
+        best_fitness_pruning = 0.0
     if pretrained:
         # Optimizer
-        if ckpt['optimizer'] is not None:
+        if ckpt.get('optimizer'):
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
 
@@ -292,7 +304,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
-    mAp = None
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
@@ -427,14 +438,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     mask.init_mask(opt.layer_rate, False)
                     mask.do_mask()
                     mask.if_zero(epoch, save_dir / opt.pruning_details_file)
-                    mAp = round(val.run(data_dict,
-                                        batch_size = batch_size // WORLD_SIZE * 2, 
-                                        imgsz = imgsz_val,
-                                        model = mask.model,
-                                        plots = False,
-                                        dataloader = valloader)[0][3], 3)
+                    results_pruning, _, _ =  val.run(data_dict,
+                                                    batch_size = batch_size // WORLD_SIZE * 2, 
+                                                    imgsz = imgsz_val,
+                                                    model = mask.model,
+                                                    plots = False,
+                                                    dataloader = valloader)
                     prefix = colorstr('Pruning Results:')
-                    logging.info(f'{prefix} Before mAp:{round(results[3], 3)} | After mAp:{mAp}')
+                    logging.info(f'{prefix} Before mAp:{round(results[3], 3)} | After mAp:{round(results_pruning[3], 3)}')
             # Write
             with open(results_file, 'a') as f:
                 f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
@@ -451,6 +462,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     wandb_logger.log({tag: x})  # W&B
 
             # Update best mAP
+            if use_pruning:
+                fi_pruning = fitness(np.array(results_pruning).reshape(1, -1))
+
+                if fi_pruning > best_fitness_pruning:
+                    best_fitness_pruning = fi_pruning
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
@@ -466,11 +482,16 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_logger.wandb_run.id if loggers['wandb'] else None}
-
+                if use_pruning:
+                    ckpt_pruning = {'epoch': epoch,
+                                    'best_fitness': best_fitness_pruning,
+                                    'model': deepcopy(de_parallel(model)).half()}
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                if best_fitness_pruning == fi_pruning:
+                    torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_pruning' + best.suffix))
                 if loggers['wandb']:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
                         wandb_logger.log_model(last.parent, opt, epoch, fi, best_model=best_fitness == fi)
@@ -503,7 +524,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Strip optimizers
             for f in last, best:
                 if f.exists():
-                    strip_optimizer(f, use_pruning = use_pruning)  # strip optimizers
+                    strip_optimizer(f)  # strip optimizers
             if loggers['wandb']:  # Log the stripped model
                 loggers['wandb'].log_artifact(str(best if best.exists() else last), type='model',
                                               name='run_' + wandb_logger.wandb_run.id + '_model',
@@ -557,8 +578,9 @@ def parse_opt(known=False):
     parser.add_argument('--layer-rate', type=float, default='1.0', help='the ratio of pruning')
     parser.add_argument('--layer-gap', type=str, default='0, 320, 3')
     parser.add_argument('--skip-downsample', action='store_true', help='whether skip the corresponding layers')
-    parser.add_argument('--pruning_details_file', type=str, default='pruning_details_file.txt', help='pruning details file')
-    
+    parser.add_argument('--pruning-details-file', type=str, default='pruning_details_file.txt', help='pruning details file')
+    parser.add_argument('--retrain', action='store_true', help='whether retrain after pruning')
+    parser.add_argument('--pruning-cfg', type=str, default='pruning_cfg.json', help='the cfg of pruning details')
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 

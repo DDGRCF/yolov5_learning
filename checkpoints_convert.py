@@ -9,7 +9,7 @@ import torch
 from models.yolol import Model
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--weights', type=str, default='./weights/yolov5l.pt')
+parser.add_argument('--weights', type=str, default='runs/train/exp22/weights/best.pt')
 args = parser.parse_args()
 weights_path = Path(args.weights)
 
@@ -22,11 +22,12 @@ model_dst_dict = model_dst.state_dict()
 
 model_dst_keys_list = list(model_dst_dict.keys())
 
-for i, (k, v) in enumerate(model_src.state_dict().items()):
-    if 'num_batches_tracked' in k:
-        print(f'{i}|{k}|{v}')
-# for i, n in enumerate(zip(model_dst.named_parameters(), model_src.named_parameters())):
-#     print(f'{i}|{n[1][0]}|{n[0][0]}|{n[1][1].shape}')
+# for i, (k, v) in enumerate(model_src.state_dict().items()):
+#     if 'num_batches_tracked' in k:
+#         print(f'{i}|{k}|{v}')
+
+for i, (n, k) in enumerate(model_src.named_parameters()):
+    print(f'{i}|{n}|{k.shape}')
 
 # for ind, value in enumerate(model_src_dict.values()):
 #     model_dst_dict[model_dst_keys_list[ind]] = value
