@@ -24,7 +24,6 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data
 import yaml
-import json
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -35,7 +34,7 @@ sys.path.append(FILE.parents[0].as_posix())  # add yolov5/ to path
 
 import val  # for end-of-epoch mAP
 from models.experimental import attempt_load
-from models.yolo import Model
+
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
@@ -47,7 +46,7 @@ from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 from utils.metrics import fitness
-from utils.prune_utils import Mask, get_pruning_cfg
+from utils.prune_utils import Mask
 logger = logging.getLogger(__name__)
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
@@ -72,6 +71,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if retrain:
         from models.yolov5l_pruning import Model
         pruning_cfg = Path(weights).parents[0] / opt.pruning_cfg
+    else:
+        from models.yolo import Model
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -123,7 +124,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         if retrain:
-            model = Model(cfg, ch=3, nc=nc, channel_index=pruning_cfg, anchors=hyp.get('anchors')).to(device)
+            model = Model(ckpt['model'].cfg, ch=3, nc=nc, channel_index=pruning_cfg, anchors=hyp.get('anchors')).to(device)
         else:
             model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
@@ -490,8 +491,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
-                if best_fitness_pruning == fi_pruning:
-                    torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_pruning' + best.suffix))
+                if use_pruning:
+                    if best_fitness_pruning == fi_pruning:
+                        torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_pruning' + best.suffix))
                 if loggers['wandb']:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
                         wandb_logger.log_model(last.parent, opt, epoch, fi, best_model=best_fitness == fi)

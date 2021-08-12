@@ -61,6 +61,7 @@ class Mask:
                 self.mat[index] = self.convert2tensor(self.mat[index])
                 if self.cuda:
                     self.mat[index] = self.mat[index].to(self.device)
+
         logging.info('Mask Ready...')
 
     def do_mask(self):
@@ -78,10 +79,11 @@ class Mask:
             weight_vec = weight_torch.view(weight_torch.size()[0], -1) # view不是inplace，重新复制了一份
             norm2 = torch.norm(weight_vec, 2, 1) 
             norm2_np = norm2.cpu().numpy()
-            filter_index = norm2_np.argsort()[:filter_pruned_num]
+            filter_index = norm2_np.argsort()[ :filter_pruned_num]
             kernel_length = np.prod(weight_torch.size()[1: ])
             for x in range(0, len(filter_index)):
                 codebook[filter_index[x] * kernel_length: (filter_index[x] + 1) * kernel_length] = 0
+
             return codebook
 
     def convert2tensor(self, x):

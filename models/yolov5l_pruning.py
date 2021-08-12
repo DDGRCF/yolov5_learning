@@ -81,7 +81,7 @@ class Model(nn.Module):
         ch = self.cfg['ch'] = self.cfg.get('ch', ch)
         if nc and nc != self.cfg['nc']:
             logger.info(f"Overriding model.yaml nc={self.cfg['nc']} with nc={nc}")
-
+            self.cfg['nc'] = nc
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.cfg['anchors'] = round(anchors)

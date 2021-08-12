@@ -35,10 +35,12 @@ class Bottleneck(nn.Module):
         self.cv1 = Conv(c_p1, 1, 1)
         self.cv2 = Conv(c_p2, 3, 1, g=g)
 
-        self.keep_index = c_p2[-1] 
+        self.keep_index = torch.LongTensor(c_p2[-1])
     def forward(self, x):
-        if self.add:
-            x[:, self.keep_index] = x[:, self.keep_index] + self.cv2(self.cv1(x))
+        if self.add and not self.training:
+            x.index_add_(1, self.keep_index.to(x.device), self.cv2(self.cv1(x)))
+        elif self.add and self.training:
+            x = x.index_add(1, self.keep_index.to(x.device), self.cv2(self.cv1(x)))
         else:
             x = self.cv2(self.cv1(x))
         return x
