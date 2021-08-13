@@ -6,6 +6,7 @@ from utils.general import colorstr
 from utils.torch_utils import is_parallel
 logger = logging.getLogger(__name__)
 
+# Soft Filters Pruning
 class Mask:
     def __init__(self, 
                  model, 
@@ -141,3 +142,13 @@ def get_pruning_cfg(cfg):
     return new_cfg
 
                 
+# Network Slimming
+class BNOptimizer():
+
+    @staticmethod
+    def updateBN(sr_flag, module_list, s, prune_idx):
+        if sr_flag:
+            for idx in prune_idx:
+                # Squential(Conv, BN, Lrelu)
+                bn_module = module_list[idx][1]
+                bn_module.weight.grad.data.add_(s * torch.sign(bn_module.weight.data))  # L1
