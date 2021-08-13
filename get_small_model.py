@@ -24,7 +24,7 @@ def main(opt):
     # Load the model
     weights = Path(weights)
     pruning_weights = weights.parents[0] / ('pruning_' + weights.name)
-    pruning_cfg = weights.parents[0] / 'pruning_cfg.pt'
+    pruning_cfg = weights.parents[0] / 'pruning_cfg.json'
     cfg = Path(cfg)
     assert weights.match('*.pt'), 'the file must be the type of *.pt '
     ckpt = torch.load(weights, map_location=lambda storage, loc: storage) # 将权重从gpu上加载进cpu中
