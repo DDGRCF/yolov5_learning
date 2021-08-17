@@ -576,6 +576,7 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     # train prune config
     parser.add_argument('--use-pruning', action='store_true', help='whether use pruning or not')
+    parser.add_argument('--skip-list', type=int, nargs='*', default=[0, 3], help='the layers to skip')
     parser.add_argument('--pruning-frequency', type=int, default=1, help='the inter epoch to prune')
     parser.add_argument('--layer-rate', type=float, default='1.0', help='the ratio of pruning')
     parser.add_argument('--layer-gap', type=str, default='0, 320, 3')

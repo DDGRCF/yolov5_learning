@@ -1,7 +1,8 @@
 from typing import OrderedDict
 import torch
-import numpy as np
 import logging
+import torch.nn as nn
+import numpy as np
 from utils.general import colorstr
 from utils.torch_utils import is_parallel
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ class Mask:
         for key in range(self.layer_begin, self.layer_end, self.layer_inter):
             self.compress_rate[key] = layer_rate
         last_index = 321
-        skip_list = [0, 3] #[x for x in range(0, last_index, 3) if x not in range(0, 201, 3)]
+        skip_list = self.opt.skip_list #[x for x in range(0, last_index, 3) if x not in range(0, 201, 3)]
         # [0,3, 
         # 6,15,21,27,
         # 36,45,51,57,63,69,75,81,87,93,
@@ -144,11 +145,23 @@ def get_pruning_cfg(cfg):
                 
 # Network Slimming
 class BNOptimizer():
+    def __init__(self, model, device, opt, ratio):
+        self.model = model.module if is_parallel(model) else model
+        self.opt = opt
+        self.s = ratio
+        
+    def init_dict(self):
+        """这里通过遍历state_dict，寻找每个bn层对应的卷积层。
+           这是由于bn的裁剪是由卷积的裁剪决定的，同时这样做可以与上面的SFP的卷积层对应
+        """
+        self.layer = OrderedDict()
+        for i, name in enumerate(self.model.state_dict()):
+            if name.endswith('.bn.weights'):
+                self.layer[i - 1] = name.rstrip('.weights')
 
-    @staticmethod
-    def updateBN(sr_flag, module_list, s, prune_idx):
-        if sr_flag:
-            for idx in prune_idx:
-                # Squential(Conv, BN, Lrelu)
-                bn_module = module_list[idx][1]
-                bn_module.weight.grad.data.add_(s * torch.sign(bn_module.weight.data))  # L1
+    def updateBN(self):
+        skip_list = [self.layer[k] for k in self.opt.skip_list]
+        for i, (name, module) in enumerate(self.model.named_modules()):
+            if isinstance(module, nn.BatchNorm2d):
+                if name not in skip_list:
+                    module.weight.grad.data.add_(self.s * torch.sign(module.weight.data))
