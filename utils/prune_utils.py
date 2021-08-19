@@ -210,7 +210,7 @@ def model_eval(model, data_dict, device=None):
     valloader = create_dataloader(data_dict['val'], 640, 1, gs, 
                                   workers=1, pad=0.5, rect=True,
                                   prefix=colorstr('val: '))[0]
-    
+    # TODO:释放deepcopy的内存空间
     with torch.no_grad():
         results, _, _ = val.run(data_dict,
                                 batch_size = 1, 
@@ -224,24 +224,21 @@ def model_eval(model, data_dict, device=None):
 
 def model_compare(model, model_pruning):
     logger.info('begin printing different of each layer...')
-    model.eval()
-    model_pruning.eval()
-    with torch.no_grad():
-        input = torch.randn((1, 3, 640, 640))
-        output = model(input, features=True)
-        output_ = model_pruning(input, features=True)
-        # 将每一层输出的feature maps的L1 norm打印
-        table = PrettyTable([colorstr('layer'), 
-                             colorstr('unpruning'), 
-                             colorstr('pruning'), 
-                             colorstr('distance')])
-        for i, (o1, o2) in enumerate(zip(output, output_)):
-            if isinstance(o1, tuple) or isinstance(o2, tuple):
-                o1 = o1[0]
-                o2 = o2[0]
-            distance = torch.norm(o1) - torch.norm(o2)
+    # 将每一层输出的feature maps的L1 norm打印
+    table = PrettyTable([colorstr('layer'),
+                         colorstr('name'), 
+                         colorstr('unpruning'), 
+                         colorstr('pruning'), 
+                         colorstr('distance')])
+    ignore = ['bn', 'running_mean', 'running_var', 'num_batches_tracked']
+    for i, (c1, c2) in enumerate(zip(model.state_dict().items(), model_pruning.state_dict().items())):
+        if not any([k in c1[0] for k in ignore]):
+            p1_total = torch.norm(c1[1])
+            p2_total = torch.norm(c2[1])
+            distance = p1_total - p2_total
             table.add_row([i, 
-                           round(torch.norm(o1).item(), 5),
-                           round(torch.norm(o2).item(), 5), 
-                           round(distance.item(), 5)])
-        logger.info(table)
+                        c1[0],
+                        round(p1_total.item(), 5),
+                        round(p2_total.item(), 5), 
+                        round(distance.item(), 5)])
+    logger.info(table)

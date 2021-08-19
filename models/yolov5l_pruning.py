@@ -63,7 +63,7 @@ class Model(nn.Module):
     def __init__(self, 
                  cfg='models/yolov5l.yaml', 
                  ch=3, nc=None, anchors=None, 
-                 channel_index=None):
+                 pruning_cfg=None):
         super(Model, self).__init__()
         if isinstance(cfg, str):
             with open(cfg) as f:
@@ -71,12 +71,12 @@ class Model(nn.Module):
         else:
             self.cfg = cfg
 
-        if isinstance(channel_index, str) or isinstance(channel_index, Path):
-            assert channel_index.match('*.json'), 'this is not pruning cfg'
-            with open(channel_index, 'rb') as f:
-                self.channel_index = get_pruning_cfg(json.load(f))
+        if isinstance(pruning_cfg, str) or isinstance(pruning_cfg, Path):
+            assert pruning_cfg.match('*.json'), 'this is not pruning cfg'
+            with open(pruning_cfg, 'rb') as f:
+                self.pruning_cfg = get_pruning_cfg(json.load(f))
         else:
-            self.channel_index = channel_index
+            self.pruning_cfg = pruning_cfg
 
         ch = self.cfg['ch'] = self.cfg.get('ch', ch)
         if nc and nc != self.cfg['nc']:
@@ -85,7 +85,7 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.cfg['anchors'] = round(anchors)
-        self.model, self.save = build_model(self.cfg, self.channel_index) 
+        self.model, self.save = build_model(self.cfg, self.pruning_cfg) 
         self.names = [str(i) for i in range(self.cfg['nc'])]
         self.inplace = self.cfg.get('inplace', True)
         m = self.model[-1]
@@ -204,11 +204,11 @@ def build_model(cfg, ch_p):
             args.insert(1, n)
         elif m is Detect:
             args = [cfg.get('nc'), cfg.get('anchors'), ch_p.get(i)]
-
         m_ = m(*args)
         np = sum([x.numel() for x in m_.parameters()])
         t = str(m)[8: -2].replace('__main__.', '')
         m_.i, m_.f, m_.type, m_.np = i, f, t, np
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
+
     return nn.Sequential(*layers), sorted(save)
