@@ -20,15 +20,12 @@ from utils.general import set_logging
 from utils.prune_utils import model_compare, model_eval
 from utils.torch_utils import select_device
 
-
-
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())
-
-torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True
 set_logging()
 logger = logging.getLogger(__name__)
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 
 def main(opt):
     setup_seed(20)
@@ -70,20 +67,19 @@ def main(opt):
     state_dict_ = OrderedDict()
     keep_mask = []
 
-    # for i, (name, module) in enumerate(model.named_modules()):
-    #     if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.Conv2d):
-    #         print(name, module)
+    bn_activate = OrderedDict()
+    conv_module = OrderedDict()
 
-
-
-
-
-
-
-
-
-
-
+    # store the bn and conv
+    for i, (name, module) in enumerate(model.named_modules()):
+        if isinstance(module, nn.BatchNorm2d):
+            module_ = deepcopy(module)
+            module_.eval()
+            bn_activate[name] = module_
+        elif isinstance(module, nn.Conv2d):
+            module_ = deepcopy(module)
+            module_.eval()
+            conv_module[name] = module_  
 
     # prune the output channels params
     len_pbar = len(state_dict)
@@ -104,7 +100,7 @@ def main(opt):
                     else:
                         k = keep_mask[f][-1]
                 elif ('cv2' in n) and (m_index == 8) and '.m.' not in n:
-                    k = torch.cat([(keep_mask[-1][-1] + keep_mask[-1][0][0]) for d in range(4)]) # TODO:4 to general
+                    k = torch.cat([(keep_mask[-1][-1] + d * keep_mask[-1][0][0]) for d in range(4)]) # TODO:4 to general
                 elif ('cv2' in n) and (m_index != 8) and '.m.' not in n:
                     f = input_from[m_index - 1]
                     if isinstance(f, list):
@@ -121,11 +117,13 @@ def main(opt):
                     k2 = channel_index[m_index][1][-1] + keep_mask[-1][0][0]
                     k = torch.cat((k1, k2), dim=0)
                 elif '.cv1' in n and shortcut[m_index] == True and '.m.' in n:
-                    k = torch.LongTensor(range(keep_mask[-(2 if '.0.' in n else 1)][0][0]))
+                    if '.0.' in n:
+                        k = keep_mask[-2][-1] # 处理m模块的第一个输入的从cv1
+                    else:
+                        k = torch.LongTensor(range(keep_mask[-1][0][0])) # 处理m模块的后面输入的cv1
                 else:
-                    k = keep_mask[-1][-1]
+                    k = keep_mask[-1][-1] # 处理m模块的cv2
                 state_dict_[n] = torch.index_select(param, 1, k)
-
             # 输出通道裁剪
             temp_param = state_dict_[n] if before_i > -1 else param
             if shortcut[m_index] == True and '.cv1.' in n and '.m.' not in n:  
@@ -134,13 +132,13 @@ def main(opt):
                 keep_index = torch.nonzero(torch.sum(temp_param.data, dim=(1, 2, 3)) != 0).view(-1) 
             state_dict_[n] = torch.index_select(temp_param, 0, keep_index)
 
-            keep_mask.append((param.shape[: 2], keep_index))
+            keep_mask.append((temp_param.shape[: 2], keep_index))
             if m_index in channel_index:
-                channel_index[m_index] += [(param.shape[: 2], keep_index)]
+                channel_index[m_index] += [(temp_param.shape[: 2], keep_index)]
             else:
-                channel_index[m_index] = [(param.shape[: 2], keep_index)]
- 
+                channel_index[m_index] = [(temp_param.shape[: 2], keep_index)]
 
+            
         elif (i not in layer_index) and (first_layer < i < last_layer + 1):
             if len(param.shape) != 0:
                 state_dict_[n] = torch.index_select(param, 0, keep_mask[-1][-1])
@@ -153,10 +151,9 @@ def main(opt):
                 state_dict_[n] = torch.index_select(param, 1, k)
             else:
                 state_dict_[n] = param.clone()      
-    logger.info('the output channels pruning is completed!!!')
 
-    for i, (n, p) in enumerate(state_dict_.items()):
-        print(i, n, p.shape)
+    # for i, (n, p) in enumerate(state_dict_.items()):
+    #     print(i, n, p.shape)
     # get pruning cfg information
     logger.info('the input channels pruning is completed!!!')
     pruning_cfg = OrderedDict()
