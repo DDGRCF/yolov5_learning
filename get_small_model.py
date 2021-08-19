@@ -12,28 +12,36 @@ from pathlib import Path
 from copy import deepcopy
 from utils.general import set_logging
 from tqdm import tqdm
-
+from utils.prune_utils import model_compare, model_eval
+from utils.torch_utils import select_device
 FILE = Path(__file__).absolute()
 sys.path.append(FILE.parents[0].as_posix())
+
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 set_logging()
 logger = logging.getLogger(__name__)
 
 def main(opt):
     setup_seed(20)
-    weights, cfg = opt.weights, opt.cfg
+    weights, cfg, data, device = opt.weights, opt.cfg, opt.data, opt.device
     # Load the model
+    device = select_device(device)
     weights = Path(weights)
     pruning_weights = weights.parents[0] / ('pruning_' + weights.name)
     pruning_cfg = weights.parents[0] / 'pruning_cfg.json'
     cfg = Path(cfg)
     assert weights.match('*.pt'), 'the file must be the type of *.pt '
     ckpt = torch.load(weights, map_location=lambda storage, loc: storage) # 将权重从gpu上加载进cpu中
-    model = ckpt['model'].float()
- 
-    # Load the model configuration
     assert cfg.match('*.yaml'), 'the file must be the type of *.yaml'
     with open(cfg) as f:
         cfg = yaml.safe_load(f)
+    data = Path(data)
+    with open(data) as f:
+        data_dict = yaml.safe_load(f)
+
+    # Load the model configuration
+    model = ckpt['model'].float()
     cfg['nc'] = model.yaml.get('nc', 1)
 
     input_from = OrderedDict()
@@ -80,7 +88,7 @@ def main(opt):
                 state_dict_[n] = param.clone()
         else:
             state_dict_[n] = param.clone()
-    logger.info('the ouput channels pruning complete!!!')
+    logger.info('the output channels pruning is completed!!!')
     # del state_dict_strip
     # prune the input channels
     len_pbar = len(state_dict_)
@@ -139,7 +147,7 @@ def main(opt):
                     state_dict_[n] = torch.index_select(param, 1, k)
 
     # get pruning cfg information
-    logger.info('the input channels pruning complete!!!')
+    logger.info('the input channels pruning is completed!!!')
     channel_index = OrderedDict()
     index_ = -1
     for i, (n, param) in enumerate(state_dict_.items()):
@@ -174,26 +182,11 @@ def main(opt):
 
     model_pruning.load_state_dict(new_state_dict, strict=True)
 
-    # for i, (n1, n2) in enumerate(zip(state_dict_strip.items(), state_dict_.items())):
-    #     if i in layer_index:
-    #         print(f"{n1[0]} | {torch.norm(n1[-1]) - torch.norm(n2[-1])}")
-    # compare
-    logger.info("the different between small model and big model:")
-    model.eval()
-    model_pruning.eval()
-
-    with torch.no_grad():
-        input = torch.randn((1, 3, 640, 640))
-        output = model(input, features=True)
-        output_ = model_pruning(input, features=True)
-        # 将每一层输出的feature maps的L1 norm打印
-        for i, (o1, o2) in enumerate(zip(output, output_)):
-            if isinstance(o1, tuple) or isinstance(o2, tuple):
-                o1 = o1[0]
-                o2 = o2[0]
-            different = torch.norm(o1) - torch.norm(o2)
-            logger.info(f"the different of the {i}th is {different} | {torch.norm(o1)} - {torch.norm(o2)}")
+    # evaluate the model
+    model_compare(model, model_pruning)
     
+    model_eval(model, data_dict, device)
+    model_eval(model_pruning, data_dict, device)
     # save model
     ckpt['model'] = deepcopy(model_pruning.half())
     ckpt['best_fitness'] = 0
@@ -210,6 +203,8 @@ def get_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='weights/yolov5l.pt')
     parser.add_argument('--cfg', type=str, default='models/yolov5l.yaml')
+    parser.add_argument('--data', type=str, default='data/fire.yaml')
+    parser.add_argument('--device', type=str, default='0')
     opt = parser.parse_args()
     return opt
 

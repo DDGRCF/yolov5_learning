@@ -1,13 +1,28 @@
 from typing import OrderedDict
 import torch
 import logging
+import val
 import torch.nn as nn
 import numpy as np
+from utils.metrics import fitness
 from utils.general import colorstr
 from utils.torch_utils import is_parallel
-logger = logging.getLogger(__name__)
+from utils.datasets import create_dataloader
+from prettytable import PrettyTable
+from copy import deepcopy
 
+
+logger = logging.getLogger(__name__)
 # Soft Filters Pruning
+
+def get_skip_list(model, skip_list):
+    layer = OrderedDict()
+    for i, (name, _) in enumerate(model.named_parameters()):
+        if name.endswith('.bn.weight'):
+            layer[i - 1] = name.rstrip('.weight')
+    skip_list = [layer[k] for k in skip_list]
+    
+    return skip_list
 class Mask:
     def __init__(self, 
                  model, 
@@ -145,23 +160,88 @@ def get_pruning_cfg(cfg):
                 
 # Network Slimming
 class BNOptimizer():
-    def __init__(self, model, device, opt, ratio):
+    def __init__(self, model, opt, **kwargs):
         self.model = model.module if is_parallel(model) else model
         self.opt = opt
-        self.s = ratio
-        
+
     def init_dict(self):
         """这里通过遍历state_dict，寻找每个bn层对应的卷积层。
            这是由于bn的裁剪是由卷积的裁剪决定的，同时这样做可以与上面的SFP的卷积层对应
         """
-        self.layer = OrderedDict()
-        for i, name in enumerate(self.model.state_dict()):
-            if name.endswith('.bn.weights'):
-                self.layer[i - 1] = name.rstrip('.weights')
+        self.skip_list = get_skip_list(self.model, self.opt.skip_list)
+
+        logger.info("layer init complete!!!")
 
     def updateBN(self):
-        skip_list = [self.layer[k] for k in self.opt.skip_list]
-        for i, (name, module) in enumerate(self.model.named_modules()):
+        for _, (name, module) in enumerate(self.model.named_modules()):
             if isinstance(module, nn.BatchNorm2d):
-                if name not in skip_list:
-                    module.weight.grad.data.add_(self.s * torch.sign(module.weight.data))
+                if name not in self.skip_list:
+                    module.weight.grad.data.add_(self.opt.s * torch.sign(module.weight.data))
+
+def gather_bn_weights(model, skip_list):
+    size_list = []
+    module_weights = []
+    highest_thre = []
+    for _, (name, module) in enumerate(model.named_modules()):
+        if isinstance(module, nn.BatchNorm2d):
+            if name not in get_skip_list(model, skip_list):
+                size_list.append(module.weight.data.shape[0])
+                module_weights.append(module.weight.data.abs().clone())
+                highest_thre.append(module.weight.data.abs().max().item())
+    bn_weights = torch.zeros(sum(size_list))
+    index = 0
+    for size, weight in zip(size_list, module_weights):
+        bn_weights[index: (index + size)] = weight.view(-1)
+        index += size
+    
+    return [bn_weights, min(highest_thre)]
+
+def mask_bn(model, skip_list, thre):
+    thre = thre
+    for _, (name, module) in enumerate(model.named_modules()):
+        if isinstance(module, nn.BatchNorm2d):
+            if name not in get_skip_list(model, skip_list):
+                mask = module.weight.data.abs().gt(thre).float()
+                module.weight.data.mul_(mask)
+    return model
+
+def model_eval(model, data_dict, device=None):
+    gs = max(int(model.stride.max()), 32)
+    valloader = create_dataloader(data_dict['val'], 640, 1, gs, 
+                                  workers=1, pad=0.5, rect=True,
+                                  prefix=colorstr('val: '))[0]
+    
+    with torch.no_grad():
+        results, _, _ = val.run(data_dict,
+                                batch_size = 1, 
+                                imgsz = 640,
+                                model = deepcopy(model).to(device) if device else model,
+                                plots = False,
+                                dataloader = valloader)
+    fi = fitness(np.array(results).reshape(1, -1))
+    prefix = colorstr('val results:')
+    logger.info(f"{prefix}{fi}")
+
+def model_compare(model, model_pruning):
+    logger.info('begin printing different of each layer...')
+    model.eval()
+    model_pruning.eval()
+    with torch.no_grad():
+        input = torch.randn((1, 3, 640, 640))
+        output = model(input, features=True)
+        output_ = model_pruning(input, features=True)
+        # 将每一层输出的feature maps的L1 norm打印
+        table = PrettyTable([colorstr('layer'), 
+                             colorstr('unpruning'), 
+                             colorstr('pruning'), 
+                             colorstr('distance')])
+        for i, (o1, o2) in enumerate(zip(output, output_)):
+            if isinstance(o1, tuple) or isinstance(o2, tuple):
+                o1 = o1[0]
+                o2 = o2[0]
+            distance = torch.norm(o1) - torch.norm(o2)
+            table.add_row([i, 
+                           round(torch.norm(o1).item(), 5),
+                           round(torch.norm(o2).item(), 5), 
+                           round(distance.item(), 5)])
+        logger.info(table)

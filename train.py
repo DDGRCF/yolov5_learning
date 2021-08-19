@@ -46,7 +46,8 @@ from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 from utils.metrics import fitness
-from utils.prune_utils import Mask
+from utils.prune_utils import *
+
 logger = logging.getLogger(__name__)
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
@@ -57,9 +58,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
           opt,
           device,
           ):
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, use_pruning, retrain= \
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, use_pruning, retrain, pruning_method= \
         opt.save_dir, opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
-        opt.resume, opt.noval, opt.nosave, opt.workers, opt.use_pruning, opt.retrain
+        opt.resume, opt.noval, opt.nosave, opt.workers, opt.use_pruning, opt.retrain, opt.pruning_method
 
     # Directories
     save_dir = Path(save_dir)
@@ -80,7 +81,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             hyp = yaml.safe_load(f)  # load hyps dict
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
 
-    # Save run settings
+    # Save run settings 
     with open(save_dir / 'hyp.yaml', 'w') as f:
         yaml.safe_dump(hyp, f, sort_keys=False)
     with open(save_dir / 'opt.yaml', 'w') as f:
@@ -189,14 +190,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
-    if use_pruning:
+    if use_pruning and pruning_method=="SFP":
         best_fitness_pruning = 0.0
     if pretrained:
         # Optimizer
         if ckpt.get('optimizer'):
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
-
+        
         # EMA
         if ema and ckpt.get('ema'):
             ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
@@ -281,25 +282,13 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     model.names = names
     # Do mask
     if use_pruning:
-        mask = Mask(model, device, opt) 
-        mask.init_length()
-        map_old = round(val.run(data = data_dict, 
-                                batch_size = batch_size // WORLD_SIZE * 2, 
-                                imgsz = imgsz_val, 
-                                model = mask.model, 
-                                plots=False,
-                                dataloader=valloader)[0][3], 3)
-        mask.init_mask(opt.layer_rate)
-        mask.do_mask()
-        map_new = round(val.run(data = data_dict, 
-                                batch_size = batch_size // WORLD_SIZE * 2, 
-                                imgsz = imgsz_val, 
-                                model=mask.model, 
-                                plots=False,
-                                dataloader=valloader)[0][3], 3)
-        mask.if_zero()
-        prefix = colorstr('Try pruning:')
-        logging.info(f'{prefix} Old mAp:{map_old} | New mAp:{map_new}')
+        if pruning_method == "SFP":         
+            mask = Mask(model, device, opt) 
+            mask.init_length()
+        elif pruning_method == "Network_Slimming":
+            bn_optimizer = BNOptimizer(model, opt)
+            bn_optimizer.init_dict()
+
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
@@ -346,7 +335,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
-
+            
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -374,10 +363,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.
-
             # Backward
             scaler.scale(loss).backward()
-
+            # BNOptimizer
+            if use_pruning and pruning_method == "Network_Slimming":
+                bn_optimizer.updateBN()
             # Optimize
             if ni - last_opt_step >= accumulate:
                 scaler.step(optimizer)  # optimizer.step
@@ -434,7 +424,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            wandb_logger=wandb_logger,
                                            compute_loss=compute_loss)
             # Do mask
-            if use_pruning:
+            if use_pruning and pruning_method == "SFP":
                 if (epoch % opt.pruning_frequency == 0 or final_epoch):
                     mask.init_mask(opt.layer_rate, False)
                     mask.do_mask()
@@ -463,7 +453,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     wandb_logger.log({tag: x})  # W&B
 
             # Update best mAP
-            if use_pruning:
+            if use_pruning and pruning_method == "SFP":
                 fi_pruning = fitness(np.array(results_pruning).reshape(1, -1))
 
                 if fi_pruning > best_fitness_pruning:
@@ -484,16 +474,22 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_logger.wandb_run.id if loggers['wandb'] else None}
                 if use_pruning:
-                    ckpt_pruning = {'epoch': epoch,
-                                    'best_fitness': best_fitness_pruning,
-                                    'model': deepcopy(de_parallel(model)).half()}
+                    ckpt_pruning = {
+                        'epoch': epoch,
+                        'best_fitness': best_fitness_pruning if pruning_method == "SFP" else best_fitness,
+                        'model': deepcopy(de_parallel(model)).half(),
+                        'skip_list': opt.skip_list
+                    }
+                    if pruning_method == "SFP":
+                        if best_fitness_pruning == fi_pruning:
+                            torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_pruning' + best.suffix))
+                    elif pruning_method == "Network_Slimming":
+                        if best_fitness == fi:
+                            torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_sparse' + best.suffix))
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
-                if use_pruning:
-                    if best_fitness_pruning == fi_pruning:
-                        torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_pruning' + best.suffix))
                 if loggers['wandb']:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
                         wandb_logger.log_model(last.parent, opt, epoch, fi, best_model=best_fitness == fi)
@@ -577,6 +573,8 @@ def parse_opt(known=False):
     # train prune config
     parser.add_argument('--use-pruning', action='store_true', help='whether use pruning or not')
     parser.add_argument('--skip-list', type=int, nargs='*', default=[0, 3], help='the layers to skip')
+    parser.add_argument('--pruning-method', type=str, default='SFP', help='SFP | Network Slimming')
+    # SFP
     parser.add_argument('--pruning-frequency', type=int, default=1, help='the inter epoch to prune')
     parser.add_argument('--layer-rate', type=float, default='1.0', help='the ratio of pruning')
     parser.add_argument('--layer-gap', type=str, default='0, 320, 3')
@@ -584,6 +582,8 @@ def parse_opt(known=False):
     parser.add_argument('--pruning-details-file', type=str, default='pruning_details_file.txt', help='pruning details file')
     parser.add_argument('--retrain', action='store_true', help='whether retrain after pruning')
     parser.add_argument('--pruning-cfg', type=str, default='pruning_cfg.json', help='the cfg of pruning details')
+    # Network Slimming
+    parser.add_argument('--s', type=float, default=0.01, help="the ratio of L1 norm")
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 
