@@ -1,4 +1,5 @@
 from typing import OrderedDict
+from numpy.lib.function_base import select
 import torch
 import logging
 import val
@@ -52,13 +53,16 @@ class Mask:
         for key in range(self.layer_begin, self.layer_end, self.layer_inter):
             self.compress_rate[key] = layer_rate
         last_index = 321
-        skip_list = self.opt.skip_list #[x for x in range(0, last_index, 3) if x not in range(0, 201, 3)]
-        # [0,3, 
-        # 6,15,21,27,
-        # 36,45,51,57,63,69,75,81,87,93,
-        # 102,111,117,123,129,135,141,147,153,159,
-        # 174,183,189,195]
+        skip_list = [0,3, 
+        6,15,21,27,
+        36,45,51,57,63,69,75,81,87,93,
+        102,111,117,123,129,135,141,147,153,159,
+        174,183,189,195,
+        258,288,318]
+        # self.opt.skip_list 
+        # [x for x in range(0, last_index, 3) if x not in range(0, 201, 3)]
 
+        # [x for x in range(0, last_index, 3) if x not in range(0, 33, 3)]
         self.mask_index = [x for x in range(0, last_index, 3)]
         if self.opt.skip_downsample:
             for x in skip_list:
@@ -205,6 +209,11 @@ def mask_bn(model, skip_list, thre):
                 module.weight.data.mul_(mask)
     return model
 
+def get_mask(select_index, shape):
+    mask = torch.ones(shape)
+    mask[select_index] = 0
+    return mask
+
 def model_eval(model, data_dict, device=None):
     gs = max(int(model.stride.max()), 32)
     valloader = create_dataloader(data_dict['val'], 640, 1, gs, 
@@ -222,23 +231,51 @@ def model_eval(model, data_dict, device=None):
     prefix = colorstr('val results:')
     logger.info(f"{prefix}{fi}")
 
-def model_compare(model, model_pruning):
+def model_compare(model, model_pruning, mode = 'parameters'):
+
     logger.info('begin printing different of each layer...')
+    prefix = colorstr(f"{mode}")
     # 将每一层输出的feature maps的L1 norm打印
-    table = PrettyTable([colorstr('layer'),
-                         colorstr('name'), 
-                         colorstr('unpruning'), 
-                         colorstr('pruning'), 
-                         colorstr('distance')])
-    ignore = ['bn', 'running_mean', 'running_var', 'num_batches_tracked']
-    for i, (c1, c2) in enumerate(zip(model.state_dict().items(), model_pruning.state_dict().items())):
-        if not any([k in c1[0] for k in ignore]):
-            p1_total = torch.norm(c1[1])
-            p2_total = torch.norm(c2[1])
-            distance = p1_total - p2_total
-            table.add_row([i, 
-                        c1[0],
-                        round(p1_total.item(), 5),
-                        round(p2_total.item(), 5), 
-                        round(distance.item(), 5)])
+    if mode == 'parameters':
+        table = PrettyTable([colorstr('layer'),
+                             colorstr('name'), 
+                             colorstr('unpruning'), 
+                             colorstr('pruning'), 
+                             colorstr('distance')])
+        ignore = ['bn', 'running_mean', 'running_var', 'num_batches_tracked']
+        for i, (c1, c2) in enumerate(zip(model.state_dict().items(), model_pruning.state_dict().items())):
+            if not any([k in c1[0] for k in ignore]):
+                p1_total = torch.norm(c1[1])
+                p2_total = torch.norm(c2[1])
+                distance = p1_total - p2_total
+                table.add_row([i, 
+                            c1[0],
+                            round(p1_total.item(), 5),
+                            round(p2_total.item(), 5), 
+                            round(distance.item(), 5)])
+    elif mode == 'features':
+        table = PrettyTable([colorstr('layer'),
+                             colorstr('unpruning'), 
+                             colorstr('pruning'), 
+                             colorstr('distance')])
+        model.eval()
+        model_pruning.eval()
+        input = torch.randn((1, 3, 640, 640))
+        output1 = model(input, features=True)
+        output2 = model_pruning(input, features=True)
+        for i, (o1, o2) in enumerate(zip(output1, output2)):
+            if isinstance(o1, tuple) or isinstance(o2, tuple):
+                o1, o2 = o1[0], o2[0]
+            o1_norm = torch.norm(o1)
+            o2_norm = torch.norm(o2)
+            distance = o1_norm - o2_norm
+            table.add_row([i,
+                           round(o1_norm.item(), 5),
+                           round(o2_norm.item(), 5),
+                           round(distance.item(), 5)])
+    logger.info(f"the different of {prefix}:")
     logger.info(table)
+
+
+        
+

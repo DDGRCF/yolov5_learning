@@ -285,6 +285,9 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if pruning_method == "SFP":         
             mask = Mask(model, device, opt) 
             mask.init_length()
+            mask.init_mask()
+            mask.do_mask()
+            mask.if_zero()
         elif pruning_method == "Network_Slimming":
             bn_optimizer = BNOptimizer(model, opt)
             bn_optimizer.init_dict()

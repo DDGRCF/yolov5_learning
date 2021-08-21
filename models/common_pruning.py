@@ -34,8 +34,8 @@ class Bottleneck(nn.Module):
         self.add = shortcut
         self.cv1 = Conv(c_p1, 1, 1)
         self.cv2 = Conv(c_p2, 3, 1, g=g)
-
         self.keep_index = torch.LongTensor(c_p2[-1])
+        
     def forward(self, x):
         if self.add and not self.training:
             x.index_add_(1, self.keep_index.to(x.device), self.cv2(self.cv1(x)))
@@ -51,7 +51,9 @@ class C3(nn.Module):
         super(C3, self).__init__()
         self.cv1 = Conv(c_p[0], 1, 1)
         self.cv2 = Conv(c_p[1], 1, 1)
-        self.m = nn.Sequential(*[Bottleneck(c_p[2+i*2], c_p[3+i*2], shortcut, g, e=1.0) for i in range(n)])
+        self.m = nn.Sequential(
+            *[Bottleneck(c_p[2 + i * 2], c_p[3 + i * 2], shortcut, g, e=1.0) for i in range(n)]
+            )
         self.cv3 = Conv(c_p[-1], 1)  
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
