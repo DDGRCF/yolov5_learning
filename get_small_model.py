@@ -1,4 +1,3 @@
-import sys
 import yaml
 import json
 import torch
@@ -8,6 +7,8 @@ import logging
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 
 from tqdm import tqdm
 from pathlib import Path
@@ -18,34 +19,48 @@ from models.yolo import Model as Model
 from models.yolov5l_pruning import Model as Model_Pruning
 
 from utils.general import set_logging
-from utils.prune_utils import model_compare, model_eval, get_mask
+from utils.prune_utils import model_compare, model_eval, get_mask, setup_seed
 from utils.torch_utils import select_device
 
-FILE = Path(__file__).absolute()
-sys.path.append(FILE.parents[0].as_posix())
+setup_seed(20)
 set_logging()
+
 logger = logging.getLogger(__name__)
-torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True
 
 @torch.no_grad()
-def main(opt):
-    setup_seed(20)
-    weights, cfg, data, device = opt.weights, opt.cfg, opt.data, opt.device
-    # Load the model
-    device = select_device(device)
-    weights = Path(weights)
-    pruning_weights = weights.parents[0] / ('pruning_' + weights.name)
-    pruning_cfg_path = weights.parents[0] / 'pruning_cfg.json'
+def pruning(weights, 
+            device,
+            cfg,
+            data,
+            pruning_path_dir
+            ):
+    # Load relative parameters
+    device = select_device(device) if isinstance(device, str) else device
+    if isinstance(weights, str):
+        weights = Path(weights)
+        assert weights.match('*.pt'), 'the file must be the type of *.pt '
+        ckpt = torch.load(weights, map_location=lambda storage, loc: storage) # 将权重从gpu上加载进cpu中
+    if pruning_path_dir == '':
+        pruning_weights = weights.parents[0] / ('pruning_' + weights.name)
+        pruning_cfg_path = weights.parents[0] / 'pruning_cfg.json'
+    else:
+        pruning_path_dir = Path(pruning_path_dir)
+        assert pruning_path_dir.is_dir(), 'the pruning path dir must be dir'
+        pruning_weights = pruning_path_dir / 'pruning_sparse.pt'
+        pruning_cfg_path = pruning_path_dir / 'pruning_cfg.json'
+    if isinstance(data, str):
+        data = Path(data)
+        assert data.match('*.yaml'), 'the file must be the type of *.yaml'
+        with open(data) as f:
+            data_dict = yaml.safe_load(f)
+    else:
+        data_dict = data
+        
     cfg = Path(cfg)
-    assert weights.match('*.pt'), 'the file must be the type of *.pt '
-    ckpt = torch.load(weights, map_location=lambda storage, loc: storage) # 将权重从gpu上加载进cpu中
     assert cfg.match('*.yaml'), 'the file must be the type of *.yaml'
     with open(cfg) as f:
         cfg = yaml.safe_load(f)
-    data = Path(data)
-    with open(data) as f:
-        data_dict = yaml.safe_load(f)
+
 
     # Load the model configuration
     model = ckpt['model'].float()
@@ -57,9 +72,12 @@ def main(opt):
     # get orginal model configuration
     for i, m in enumerate(cfg['backbone'] + cfg['head']):
         input_from[i] = m[0]
-        shortcut[i] = m[3][-1]
+        if m[2] == 'C3':
+            shortcut[i] = m[-1][-1]
+        else:
+            shortcut[i] = None   
 
-    # Pruning the params
+    # parameters
     first_layer = 0
     last_layer = 641
     inter_layer = 6
@@ -136,15 +154,18 @@ def main(opt):
                     bn_act1 = bn_order[-1]
                     bn_act2 = bn_activation[m_index][1]
                     bn_act_total = torch.cat((bn_act1, bn_act2), 0)
-                elif '.cv1' in n and shortcut[m_index] == True and '.m.' in n:
+                elif '.cv1.' in n and shortcut[m_index] is not None and '.m.' in n:
                     if '.0.' in n:
                         k = keep_mask[-2][-1] # 处理m模块的第一个输入的从cv1
                         # bn value
                         bn_act_total = bn_order[-2]
                     else:
-                        k = torch.LongTensor(range(keep_mask[-1][0][0])) # 处理m模块的后面输入的cv1
-                        # bn value
-                        bn_act_total = bn_order[-1]
+                        if shortcut[m_index]:
+                            k = torch.LongTensor(range(keep_mask[-1][0][0]))
+                            # bn value
+                        elif not shortcut[m_index]:
+                            k = keep_mask[-1][-1]
+                        bn_act_total = bn_order[-1] 
                 else:
                     k = keep_mask[-1][-1] # 处理m模块的cv2和一般模块
                     # bn value
@@ -207,9 +228,9 @@ def main(opt):
                 state_dict_[n] = param + offset
             else:
                 state_dict_[n] = param.clone()      
-
-    # for i, (n, p) in enumerate(state_dict_.items()):
-    #     print(i, n, p.shape)
+    # analyze the state_dict
+    # for i, (n1, n2) in enumerate(zip(state_dict.items(), state_dict_.items())):
+    #     print(f"{i}|{n1[0]}|{n1[1].shape}|{n2[1].shape}")
     # get pruning cfg information
     logger.info('the input channels pruning is completed!!!')
     pruning_cfg = OrderedDict()
@@ -257,20 +278,18 @@ def main(opt):
     ckpt['epoch'] = -1
     torch.save(ckpt, pruning_weights)
 
-def setup_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-
 def get_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='weights/yolov5l.pt')
+    parser.add_argument('--device', type=str, default='2')
     parser.add_argument('--cfg', type=str, default='models/yolov5l.yaml')
     parser.add_argument('--data', type=str, default='data/fire.yaml')
-    parser.add_argument('--device', type=str, default='0')
+    parser.add_argument('--pruning_path_dir', type=str, default='')
     opt = parser.parse_args()
     return opt
+
+def main(opt):
+    pruning(**vars(opt))
 
 if __name__ == '__main__':
     opt = get_opt()

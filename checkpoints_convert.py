@@ -10,7 +10,7 @@ import torch.nn as nn
 from models.yolol import Model
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--weights', type=str, default='runs/train/exp32/weights/best.pt')
+parser.add_argument('--weights', type=str, default='runs/train/exp39/weights/best.pt')
 args = parser.parse_args()
 weights_path = Path(args.weights)
 
@@ -29,8 +29,8 @@ for i, (n, m) in enumerate(model_src.named_modules()):
 # #     if 'num_batches_tracked' in k:
 # #         print(f'{i}|{k}|{v}')
 
-# for i, (n, k) in enumerate(model_src.named_parameters()):
-#     print(f'{i}|{n}|{k.shape}')
+for i, (n, k) in enumerate(model_src.named_parameters()):
+    print(f'{i}|{n}|{k.shape}')
 
 # # for ind, value in enumerate(model_src_dict.values()):
 # #     model_dst_dict[model_dst_keys_list[ind]] = value

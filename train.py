@@ -290,7 +290,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             mask.if_zero()
         elif pruning_method == "Network_Slimming":
             bn_optimizer = BNOptimizer(model, opt)
-            bn_optimizer.init_dict()
 
     # Start training
     t0 = time.time()

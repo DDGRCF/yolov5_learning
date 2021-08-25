@@ -16,11 +16,17 @@ from copy import deepcopy
 logger = logging.getLogger(__name__)
 # Soft Filters Pruning
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    
 def get_skip_list(model, skip_list):
     layer = OrderedDict()
     for i, (name, _) in enumerate(model.named_parameters()):
         if name.endswith('.bn.weight'):
-            layer[i - 1] = name.rstrip('.weight')
+            layer[i - 1] = name.replace('.weight', '')
     skip_list = [layer[k] for k in skip_list]
     
     return skip_list
@@ -111,19 +117,19 @@ class Mask:
         x = torch.FloatTensor(x) 
         return x
 
-    def get_codebook(self, weight_torch, compress_rate, length):
-        weight_vec = weight_torch.view(length)
-        weight_np = weight_vec.cpu().numpy()
+    # def get_codebook(self, weight_torch, compress_rate, length):
+    #     weight_vec = weight_torch.view(length)
+    #     weight_np = weight_vec.cpu().numpy()
 
-        weight_abs = np.abs(weight_np)
-        weight_sort = np.sort(weight_abs)
+    #     weight_abs = np.abs(weight_np)
+    #     weight_sort = np.sort(weight_abs)
 
-        threshold = weight_sort[int(length * (1 - compress_rate))]
-        weight_np[weight_np <= -threshold] = 1
-        weight_np[weight_np >= threshold] = 1
-        weight_np[weight_np != 1] = 0
+    #     threshold = weight_sort[int(length * (1 - compress_rate))]
+    #     weight_np[weight_np <= -threshold] = 1
+    #     weight_np[weight_np >= threshold] = 1
+    #     weight_np[weight_np != 1] = 0
 
-        return weight_np
+    #     return weight_np
 
     def if_zero(self, epoch=None, save_file=None):
         prefix_print = True
@@ -158,7 +164,7 @@ def get_pruning_cfg(cfg):
                 new_cfg[k] += [cfg]
             else:
                 new_cfg[k] = [cfg]
-    logging.info('the pruning configuration convertion complete!')
+    logging.info('the pruning configuration convertion is completed!')
     return new_cfg
 
                 
@@ -168,19 +174,13 @@ class BNOptimizer():
         self.model = model.module if is_parallel(model) else model
         self.opt = opt
 
-    def init_dict(self):
-        """这里通过遍历state_dict，寻找每个bn层对应的卷积层。
-           这是由于bn的裁剪是由卷积的裁剪决定的，同时这样做可以与上面的SFP的卷积层对应
-        """
-        self.skip_list = get_skip_list(self.model, self.opt.skip_list)
-
-        logger.info("layer init complete!!!")
-
     def updateBN(self):
         for _, (name, module) in enumerate(self.model.named_modules()):
             if isinstance(module, nn.BatchNorm2d):
-                if name not in self.skip_list:
+                if name not in get_skip_list(self.model, self.opt.skip_list):
                     module.weight.grad.data.add_(self.opt.s * torch.sign(module.weight.data))
+        prefix = colorstr('Update BN is completed!')
+        logger.info(prefix)
 
 def gather_bn_weights(model, skip_list):
     size_list = []
@@ -200,14 +200,21 @@ def gather_bn_weights(model, skip_list):
     
     return [bn_weights, min(highest_thre)]
 
-def mask_bn(model, skip_list, thre):
-    thre = thre
-    for _, (name, module) in enumerate(model.named_modules()):
+def get_sparse_model(model, skip_list, ratio, sorted_bn):
+    pruned_percent = 1 - ratio
+    thre = sorted_bn[int(len(sorted_bn) * pruned_percent)]
+    logger.info(f'the ratio is {ratio}, the thre is {thre}')
+    conv_mask = OrderedDict()
+    for name, module in model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
             if name not in get_skip_list(model, skip_list):
                 mask = module.weight.data.abs().gt(thre).float()
-                module.weight.data.mul_(mask)
-    return model
+                conv_name = name.replace('bn', 'conv')
+                conv_mask[conv_name] = mask.view(-1, 1, 1, 1)
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            if name in conv_mask:
+                module.weight.data.mul_(conv_mask[name]) 
 
 def get_mask(select_index, shape):
     mask = torch.ones(shape)
