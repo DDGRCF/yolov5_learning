@@ -77,7 +77,7 @@ class Detect(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None, scale=False):  # model, input channels, number of classes
         super(Model, self).__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -113,7 +113,7 @@ class Model(nn.Module):
             # logger.info('Strides: %s' % m.stride.tolist())
 
         # Init weights, biases
-        initialize_weights(self)
+        initialize_weights(self, scale)
         self.info()
         logger.info('')
 

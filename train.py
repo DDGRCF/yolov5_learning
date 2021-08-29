@@ -127,7 +127,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if retrain:
             model = Model(ckpt['model'].cfg, ch=3, nc=nc, channel_index=pruning_cfg, anchors=hyp.get('anchors')).to(device)
         else:
-            model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+            model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'), scale=(pruning_method=='Network_Slimming')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
@@ -137,7 +137,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if retrain:
             model = Model(cfg, ch=3, nc=nc, channel_index=pruning_cfg, anchors=hyp.get('anchors')).to(device)
         else:
-            model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+            model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors'), scale=(pruning_method=='Network_Slimming')).to(device)  # create
     with torch_distributed_zero_first(RANK):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -285,7 +285,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         if pruning_method == "SFP":         
             mask = Mask(model, device, opt) 
             mask.init_length()
-            mask.init_mask()
+            mask.init_mask(opt.layer_rate)
             mask.do_mask()
             mask.if_zero()
         elif pruning_method == "Network_Slimming":
@@ -367,18 +367,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     loss *= 4.
             # Backward
             scaler.scale(loss).backward()
-            # BNOptimizer
-            if use_pruning and pruning_method == "Network_Slimming":
-                bn_optimizer.updateBN()
             # Optimize
             if ni - last_opt_step >= accumulate:
+                # BNOptimizer
+                if use_pruning and pruning_method == "Network_Slimming":
+                    bn_optimizer.updateBN(epoch, False, opt.warm_up_epoch)
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
-
             # Print
             if RANK in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
@@ -426,8 +425,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            wandb_logger=wandb_logger,
                                            compute_loss=compute_loss)
             # Do mask
-            if use_pruning and pruning_method == "SFP":
-                if (epoch % opt.pruning_frequency == 0 or final_epoch):
+            if use_pruning:
+                if pruning_method == "SFP" and (epoch % opt.pruning_frequency == 0 or final_epoch):
                     mask.init_mask(opt.layer_rate, False)
                     mask.do_mask()
                     mask.if_zero(epoch, save_dir / opt.pruning_details_file)
@@ -439,10 +438,16 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                                     dataloader = valloader)
                     prefix = colorstr('Pruning Results:')
                     logging.info(f'{prefix} Before mAp:{round(results[3], 3)} | After mAp:{round(results_pruning[3], 3)}')
+                if pruning_method == 'Network_Slimming' and epoch % opt.print_sparse_frequency == 0:
+                    prefix = colorstr('BN Scale: ')
+                    logger.info(f"{prefix}{bn_optimizer.s}")
+                    plot_sparse_histogram(model, 
+                                          opt.skip_list, 
+                                          save_file=last.parents[0] / 'sparse_histogram' / 'h.png', 
+                                          suffix=epoch)
             # Write
             with open(results_file, 'a') as f:
                 f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
-
             # Log
             tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
@@ -452,8 +457,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 if loggers['tb']:
                     loggers['tb'].add_scalar(tag, x, epoch)  # TensorBoard
                 if loggers['wandb']:
-                    wandb_logger.log({tag: x})  # W&B
-
+                    wandb_logger.log({tag: x})  # W&B         
             # Update best mAP
             if use_pruning and pruning_method == "SFP":
                 fi_pruning = fitness(np.array(results_pruning).reshape(1, -1))
@@ -488,6 +492,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     elif pruning_method == "Network_Slimming":
                         if best_fitness == fi:
                             torch.save(ckpt_pruning, best.parents[0] / (best.stem + '_sparse' + best.suffix))
+                        else:
+                            torch.save(ckpt_pruning, last.parents[0] / (last.stem + '_sparse' + last.suffix))
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
@@ -538,7 +544,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     # orginal config
-    parser.add_argument('--weights', type=str, default='weights/yolov5l.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyps/hyp.scratch.yaml', help='hyperparameters path')
@@ -586,6 +592,9 @@ def parse_opt(known=False):
     parser.add_argument('--pruning-cfg', type=str, default='pruning_cfg.json', help='the cfg of pruning details')
     # Network Slimming
     parser.add_argument('--s', type=float, default=0.01, help="the ratio of L1 norm")
+    parser.add_argument('--print-sparse-frequency', type=int, default=5, help='the inter epoch to print histogram')
+    parser.add_argument('--s_span', type=float, nargs='*', default=[0.001, 500.0], help='various s_span')
+    parser.add_argument('--warm_up_epoch', type=int, default=150, help='warm np ratio')
     opt = parser.parse_known_args()[0] if known else parser.parse_args()
     return opt
 

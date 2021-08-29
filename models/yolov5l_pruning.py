@@ -196,6 +196,7 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 def build_model(cfg, ch_p):
+    # TODO: to be general
     layers, save = [], []
     for i, (f, n, m, args) in enumerate(cfg['backbone'] + cfg['head']):
         m = eval(m)

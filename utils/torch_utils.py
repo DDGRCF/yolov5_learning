@@ -150,7 +150,7 @@ def intersect_dicts(da, db, exclude=()):
     return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}
 
 
-def initialize_weights(model):
+def initialize_weights(model, scale=False):
     for m in model.modules():
         t = type(m)
         if t is nn.Conv2d:
@@ -158,6 +158,8 @@ def initialize_weights(model):
         elif t is nn.BatchNorm2d:
             m.eps = 1e-3
             m.momentum = 0.03
+            if scale:
+                nn.init.constant_(m.weight.data, 0.5)
         elif t in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6]:
             m.inplace = True
 

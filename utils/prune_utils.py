@@ -1,20 +1,34 @@
-from typing import OrderedDict
-from numpy.lib.function_base import select
 import torch
 import logging
 import val
+import matplotlib
+font = {'family' : 'monospace',
+        'weight' : 'bold',
+        'size'   : 11}
+matplotlib.rc('font', **font)  # pass in the font dict as kwargs
+matplotlib.use('Agg')  # for writing to files only
 import torch.nn as nn
 import numpy as np
+import matplotlib.pyplot as plt
 from utils.metrics import fitness
 from utils.general import colorstr
 from utils.torch_utils import is_parallel
 from utils.datasets import create_dataloader
 from prettytable import PrettyTable
 from copy import deepcopy
-
+from typing import OrderedDict
+from numpy.lib.function_base import select
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 # Soft Filters Pruning
+
+def check_dir(dir):
+    if dir.exists():
+        logger.info(f"{dir} already exists")
+    else:
+        dir.mkdir()
+        logger.info(f"{dir} is created")
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -59,12 +73,13 @@ class Mask:
         for key in range(self.layer_begin, self.layer_end, self.layer_inter):
             self.compress_rate[key] = layer_rate
         last_index = 321
-        skip_list = [0,3, 
-        6,15,21,27,
-        36,45,51,57,63,69,75,81,87,93,
-        102,111,117,123,129,135,141,147,153,159,
-        174,183,189,195,
-        258,288,318]
+        skip_list = self.opt.skip_list 
+        # [0,3, 
+        # 6,15,21,27,
+        # 36,45,51,57,63,69,75,81,87,93,
+        # 102,111,117,123,129,135,141,147,153,159,
+        # 174,183,189,195,
+        # 258,288,318]
         # self.opt.skip_list 
         # [x for x in range(0, last_index, 3) if x not in range(0, 201, 3)]
 
@@ -173,14 +188,34 @@ class BNOptimizer():
     def __init__(self, model, opt, **kwargs):
         self.model = model.module if is_parallel(model) else model
         self.opt = opt
+        self.s = 0.0
+        logger.info("BNoptimizer init is completed!")
 
-    def updateBN(self):
-        for _, (name, module) in enumerate(self.model.named_modules()):
+    def updateBN(self, epoch, keep_s=True, warmup_epoch=70):
+        for name, module in self.model.named_modules():
             if isinstance(module, nn.BatchNorm2d):
                 if name not in get_skip_list(self.model, self.opt.skip_list):
-                    module.weight.grad.data.add_(self.opt.s * torch.sign(module.weight.data))
-        prefix = colorstr('Update BN is completed!')
-        logger.info(prefix)
+                    module.weight.grad.data.add_((self.opt.s if keep_s else self.update_scale(epoch, warmup_epoch)) * torch.sign(module.weight.data))
+    
+    def scale_gamma(self, scale_down=False):
+        # TODO:scale BN and Conv weight to accelerate sparity
+        alpha = self.alpha
+        alpha_ = 1 / alpha
+        if not scale_down:
+            alpha_ = alpha
+            alpha = 1 / alpha
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.BatchNorm2d):
+                if name not in get_skip_list(self.model, self.opt.skip_list):
+                    module.weight.data.mul_(alpha)
+
+    def update_scale(self, epoch, warmup_epoch=30):
+        span = self.opt.s_span
+        if epoch < warmup_epoch:
+            self.s = max(span) - (max(span) - min(span)) * (epoch + 1) / warmup_epoch
+        else:
+            self.s = self.opt.s
+        return self.s
 
 def gather_bn_weights(model, skip_list):
     size_list = []
@@ -208,7 +243,7 @@ def get_sparse_model(model, skip_list, ratio, sorted_bn):
     for name, module in model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
             if name not in get_skip_list(model, skip_list):
-                mask = module.weight.data.abs().gt(thre).float()
+                mask = module.weight.data.abs().ge(thre).float()
                 conv_name = name.replace('bn', 'conv')
                 conv_mask[conv_name] = mask.view(-1, 1, 1, 1)
     for name, module in model.named_modules():
@@ -283,6 +318,35 @@ def model_compare(model, model_pruning, mode = 'parameters'):
     logger.info(f"the different of {prefix}:")
     logger.info(table)
 
+def get_sparse_contents(sorted_weights, groups_number=5):
+    logger.info("the sparse contents table:")
+    numbers = int(len(sorted_weights) / groups_number)
+    columns = [colorstr(f"{i * 100 / groups_number}~{(i + 1) * 100 / groups_number}%") 
+                        for i in range(groups_number)]
+    columns_values = [round(sorted_weights[(i + 1) * numbers].item(), 4)
+                      if (i + 1) != groups_number else round(sorted_weights[-1].item(), 4)
+                      for i in range(groups_number)]
+    table = PrettyTable(columns)
+    table.add_row(columns_values)
+    logger.info(table)
+    
+def plot_sparse_histogram(model_plot, skip_list, save_file=None, suffix=None):
+    sorted_bn = (torch.sort(gather_bn_weights(model_plot, skip_list)[0])[0]).numpy().tolist()
+    plt.hist(sorted_bn, bins=100, facecolor='blue', edgecolor="black", alpha=0.7)
+    plt.xlabel('Span')
+    plt.ylabel('Value')
+    plt.title('BN Value Distribution')
+    if save_file: 
+        check_dir(save_file.parents[0])
+        if suffix is not None:
+            save_file = save_file.parents[0] / (save_file.stem + '_' + str(suffix) + save_file.suffix)
+        plt.savefig(save_file)
+    else:
+        plt.show()
+    plt.cla()
+    logger.info(f"save the histogram to {save_file}")
 
-        
+
+
+
 
